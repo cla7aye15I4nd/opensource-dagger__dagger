@@ -160,69 +160,74 @@ func (r *Release) Publish( //nolint:gocyclo
 		Version: version,
 	}
 
-	artifact := &ReleaseReportArtifact{
+	engineArtifact := &ReleaseReportArtifact{
 		Name:   "🚙 Engine",
 		Tag:    tag,
 		Notify: true,
 	}
-
-	tags := []string{tag, commit}
-	if semver.IsValid(version) && semver.Prerelease(version) == "" {
-		// this is a public release
-		tags = append(tags, "latest")
-	}
-	err := dag.EngineDev(r.Workspace).Publish(ctx, tags, dagger.EngineDevPublishOpts{
-		Image:            registryImage,
-		RegistryUsername: registryUsername,
-		RegistryPassword: registryPassword,
-		DryRun:           dryRun,
-	})
-	if err != nil {
-		artifact.Errors = append(artifact.Errors, dag.Error(err.Error()))
-	}
-	report.Artifacts = append(report.Artifacts, artifact)
-
-	artifact = &ReleaseReportArtifact{
+	cliArtifact := &ReleaseReportArtifact{
 		Name: "🚗 CLI",
 		Tag:  tag,
 	}
-	cliDevOpts := dagger.CliDevOpts{
-		// Dependencies don't inherit the workspace; forward it explicitly.
-		Ws: r.Workspace,
-	}
-	if version != "" {
-		cliDevOpts.Version = version
-	}
-	cliDev := dag.CliDev(cliDevOpts)
-	if !dryRun {
-		_, err := cliDev.
-			Publish(tag, commit, githubOrgName, dagger.CliDevPublishOpts{
-				GithubToken:        githubToken,
-				GithubHost:         githubHost,
-				GithubCaCert:       githubCaCert,
-				AwsAccessKeyID:     awsAccessKeyID,
-				AwsSecretAccessKey: awsSecretAccessKey,
-				AwsRegion:          awsRegion,
-				AwsBucket:          awsBucket,
-				ArtefactsFqdn:      artefactsFQDN,
-				AwsEndpointURL:     awsEndpointURL,
-			}).
-			Sync(ctx)
-		if err != nil {
-			artifact.Errors = append(artifact.Errors, dag.Error(err.Error()))
+
+	var corePublish errgroup.Group
+	corePublish.Go(func() error {
+		tags := []string{tag, commit}
+		if semver.IsValid(version) && semver.Prerelease(version) == "" {
+			// this is a public release
+			tags = append(tags, "latest")
 		}
-		err = cliDev.PublishMetadata(ctx, awsAccessKeyID, awsSecretAccessKey, awsRegion, awsBucket, awsCloudfrontDistribution, dagger.CliDevPublishMetadataOpts{
-			AwsEndpointURL: awsEndpointURL,
-		})
-		if err != nil {
-			artifact.Errors = append(artifact.Errors, dag.Error(err.Error()))
+		if err := dag.EngineDev(r.Workspace).Publish(ctx, tags, dagger.EngineDevPublishOpts{
+			Image:            registryImage,
+			RegistryUsername: registryUsername,
+			RegistryPassword: registryPassword,
+			DryRun:           dryRun,
+		}); err != nil {
+			engineArtifact.Errors = append(engineArtifact.Errors, dag.Error(err.Error()))
 		}
-	} else {
-		if err := cliDev.ReleaseDryRun(ctx); err != nil {
-			artifact.Errors = append(artifact.Errors, dag.Error(err.Error()))
+		return nil
+	})
+	corePublish.Go(func() error {
+		cliDevOpts := dagger.CliDevOpts{
+			// Dependencies don't inherit the workspace; forward it explicitly.
+			Ws: r.Workspace,
 		}
+		if version != "" {
+			cliDevOpts.Version = version
+		}
+		cliDev := dag.CliDev(cliDevOpts)
+		if !dryRun {
+			_, err := cliDev.
+				Publish(tag, commit, githubOrgName, dagger.CliDevPublishOpts{
+					GithubToken:        githubToken,
+					GithubHost:         githubHost,
+					GithubCaCert:       githubCaCert,
+					AwsAccessKeyID:     awsAccessKeyID,
+					AwsSecretAccessKey: awsSecretAccessKey,
+					AwsRegion:          awsRegion,
+					AwsBucket:          awsBucket,
+					ArtefactsFqdn:      artefactsFQDN,
+					AwsEndpointURL:     awsEndpointURL,
+				}).
+				Sync(ctx)
+			if err != nil {
+				cliArtifact.Errors = append(cliArtifact.Errors, dag.Error(err.Error()))
+			}
+			err = cliDev.PublishMetadata(ctx, awsAccessKeyID, awsSecretAccessKey, awsRegion, awsBucket, awsCloudfrontDistribution, dagger.CliDevPublishMetadataOpts{
+				AwsEndpointURL: awsEndpointURL,
+			})
+			if err != nil {
+				cliArtifact.Errors = append(cliArtifact.Errors, dag.Error(err.Error()))
+			}
+		} else if err := cliDev.ReleaseDryRun(ctx); err != nil {
+			cliArtifact.Errors = append(cliArtifact.Errors, dag.Error(err.Error()))
+		}
+		return nil
+	})
+	if err := corePublish.Wait(); err != nil {
+		return nil, err
 	}
-	report.Artifacts = append(report.Artifacts, artifact)
+	report.Artifacts = append(report.Artifacts, engineArtifact, cliArtifact)
 
 	if report.hasErrors() {
 		// early-exit if engine / cli could not Publish
@@ -234,7 +239,7 @@ func (r *Release) Publish( //nolint:gocyclo
 	// release notes, docs, follow-ups, and notifications.
 
 	if semver.IsValid(version) && !isPrerelease {
-		artifact = &ReleaseReportArtifact{
+		artifact := &ReleaseReportArtifact{
 			Name: "📖 Docs",
 			Link: "https://docs.dagger.io",
 		}
