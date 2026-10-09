@@ -52,19 +52,16 @@ func New(
 		From(rustSdkImage+"@"+rustSdkImageDigest).
 		WithEnvVariable("CARGO_HOME", "/root/.cargo").
 		WithMountedCache("/root/.cargo", dag.CacheVolume("rust-cargo-"+rustSdkImage)).
-		WithWorkdir("/src").
-		// FIXME: not all functions need a full engine build. Do this lazily as needed
-		With(func(c *dagger.Container) *dagger.Container {
-			return dag.DaggerEngine(workspace, dagger.DaggerEngineOpts{
-				ClientDockerConfig: clientDockerConfig,
-			}).InstallClient(dagger.DaggerEngineInstallClientOpts{Client: c})
-		})
+		WithWorkdir("/src")
+	devContainer := dag.DaggerEngine(workspace, dagger.DaggerEngineOpts{
+		ClientDockerConfig: clientDockerConfig,
+	}).InstallClient(dagger.DaggerEngineInstallClientOpts{Client: baseContainer})
 
 	return &RustClientDev{
 		OriginalWorkspace: rustSrc,
 		Workspace:         rustSrc,
 		SourcePath:        sourcePath,
-		BaseContainer:     baseContainer,
+		BaseContainer:     devContainer,
 		Ws:                workspace,
 	}
 }
@@ -195,7 +192,11 @@ func (t *RustClientDev) ReleaseDryRun(
 		versionFlag = "--bump=rc"
 	}
 
-	base := t.releaseContainer(versionFlag).
+	base, err := t.releaseContainer(ctx, versionFlag)
+	if err != nil {
+		return err
+	}
+	base = base.
 		WithExec([]string{"cargo", "publish", "-p", rustSdkCrate, "-v", "--all-features", "--dry-run"})
 
 	// if the version is not a valid semver, use the one from the Cargo.toml
@@ -266,7 +267,10 @@ func (t *RustClientDev) Release(
 		return fmt.Errorf("invalid version %q", version)
 	}
 
-	ctr := t.releaseContainer(versionFlag)
+	ctr, err := t.releaseContainer(ctx, versionFlag)
+	if err != nil {
+		return err
+	}
 	args := []string{"cargo", "publish", "-p", rustSdkCrate, "-v", "--all-features"}
 	if cargoRegistryIndex != "" {
 		// Cargo alternate registries are configured through
@@ -287,9 +291,38 @@ func (t *RustClientDev) Release(
 }
 
 func (t *RustClientDev) releaseContainer(
+	ctx context.Context,
 	versionFlag string,
-) *dagger.Container {
-	return t.DevContainer(false).
+) (*dagger.Container, error) {
+	ctr := dag.Container().
+		From(rustSdkImage+"@"+rustSdkImageDigest).
+		WithEnvVariable("CARGO_HOME", "/root/.cargo").
+		WithMountedCache("/root/.cargo", dag.CacheVolume("rust-cargo-"+rustSdkImage)).
+		WithWorkdir("/src").
+		WithMountedDirectory(".", t.Workspace).
+		WithWorkdir(t.SourcePath)
+
+	if !strings.HasPrefix(versionFlag, "--bump=") {
+		cargoToml, err := ctr.File("Cargo.toml").Contents(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var config struct {
+			Workspace struct {
+				Package struct {
+					Version string
+				}
+			}
+		}
+		if _, err := toml.Decode(cargoToml, &config); err != nil {
+			return nil, err
+		}
+		if config.Workspace.Package.Version == versionFlag {
+			return ctr, nil
+		}
+	}
+
+	return ctr.
 		WithExec([]string{"cargo", "install", "cargo-edit@" + cargoEditVersion, "--locked"}).
-		WithExec([]string{"cargo", "set-version", "-p", rustSdkCrate, versionFlag})
+		WithExec([]string{"cargo", "set-version", "-p", rustSdkCrate, versionFlag}), nil
 }
